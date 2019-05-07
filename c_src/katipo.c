@@ -234,8 +234,10 @@ static const char *curl_error_code(CURLcode error) {
       return "ssl_certproblem";
     case CURLE_SSL_CIPHER:
       return "ssl_cipher";
+    #if LIBCURL_VERSION_NUM < 0x073E00 /* Gone since 7.62.0 */
     case CURLE_SSL_CACERT:
       return "ssl_cacert";
+    #endif
     case CURLE_BAD_CONTENT_ENCODING:
       return "bad_content_encoding";
     case CURLE_LDAP_INVALID_URL:
