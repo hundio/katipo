@@ -19,6 +19,13 @@ init_per_suite(Config) ->
 end_per_suite(_Config) ->
     ok = application:stop(katipo).
 
+init_per_group(http, Config) ->
+    application:ensure_all_started(cowboy),
+    Filename = tempfile:name("katipo_test_"),
+    Dispatch = cowboy_router:compile([{'_', [{"/unix", get_handler, []}]}]),
+    {ok, _} = cowboy:start_clear(unix_socket, [{ip, {local, Filename}},
+                                               {port, 0}], #{env => #{dispatch => Dispatch}}),
+    [{unix_socket_file, Filename} | Config];
 init_per_group(session, Config) ->
     application:ensure_all_started(katipo),
     Config;
@@ -37,12 +44,27 @@ init_per_group(https, Config) ->
                                 {keyfile, filename:join(DataDir, "server.key")}],
                                #{env => #{dispatch => Dispatch}}),
     [{cacert_file, list_to_binary(CACert)} | Config];
+init_per_group(https_mutual, Config) ->
+    DataDir = ?config(data_dir, Config),
+    Cert = filename:join(DataDir, "badssl.com-client.pem"),
+    Key = filename:join(DataDir, "badssl.com-client.key"),
+    {ok, PemBin} = file:read_file(Key),
+    [KeyPem] = public_key:pem_decode(PemBin),
+    KeyDecoded = public_key:pem_entry_decode(KeyPem, <<"badssl.com">>),
+    KeyDer = public_key:der_encode('RSAPrivateKey', KeyDecoded),
+    [{cert_file, list_to_binary(Cert)},
+     {key_file, list_to_binary(Key)},
+     {decrypted_key_der, KeyDer} | Config];
 init_per_group(proxy, Config) ->
     application:ensure_all_started(http_proxy),
     Config;
 init_per_group(_, Config) ->
     Config.
 
+end_per_group(http, Config) ->
+    Filename = ?config(unix_socket_file, Config),
+    _ = file:delete(Filename),
+    Config;
 end_per_group(pool, Config) ->
     application:stop(meck),
     Config;
@@ -118,6 +140,7 @@ groups() ->
        digest_authorised,
        lock_data_ssl_session_true,
        lock_data_ssl_session_false,
+       doh_url,
        badopts,
        proxy_couldnt_connect]},
      {pool, [],
@@ -131,6 +154,8 @@ groups() ->
        verify_host_verify_peer_error,
        cacert_self_signed,
        badssl]},
+     {https_mutual, [],
+      [badssl_client_cert]},
      {proxy, [],
       [proxy_get,
        proxy_post_data]},
@@ -145,16 +170,20 @@ groups() ->
       [max_total_connections]},
      {metrics, [],
       [metrics_true,
-       metrics_false]}].
+       metrics_false]},
+     {http2, [parallel],
+      [http2_get]}].
 
 all() ->
     [{group, http},
      {group, pool},
      {group, https},
+     {group, https_mutual},
      {group, proxy},
      {group, session},
      {group, port},
-     {group, metrics}].
+     {group, metrics},
+     {group, http2}].
 
 get(_) ->
     {ok, #{status := 200, body := Body}} =
@@ -276,8 +305,9 @@ patch_qs(_) ->
 
 options(_) ->
     {ok, #{status := 200, headers := Headers}} = katipo:options(?POOL, <<"https://httpbin.org">>),
+    LowerHeaders = [{string:lowercase(K), V} || {K, V} <- Headers],
     <<"GET, POST, PUT, DELETE, PATCH, OPTIONS">> =
-        proplists:get_value(<<"Access-Control-Allow-Methods">>, Headers).
+        proplists:get_value(<<"access-control-allow-methods">>, LowerHeaders).
 
 delete(_) ->
     {ok, #{status := 200}} = katipo:delete(?POOL, <<"https://httpbin.org/delete">>).
@@ -345,16 +375,17 @@ statuses(_) ->
 cookies(_) ->
     Url = <<"https://httpbin.org/cookies/set?cname=cvalue">>,
     Opts = #{followlocation => true},
-    {ok, #{status := 200, cookiejar := CookieJar, body := Body}} = katipo:get(?POOL, Url, Opts),
+    {ok, #{status := 200, body := Body}} = katipo:get(?POOL, Url, Opts),
     Json = jsx:decode(Body),
-    [{<<"cname">>, <<"cvalue">>}] = proplists:get_value(<<"cookies">>, Json),
-    [<<"httpbin.org\tFALSE\t/\tTRUE\t0\tcname\tcvalue">>] = CookieJar.
+    [{<<"cname">>, <<"cvalue">>}] = proplists:get_value(<<"cookies">>, Json).
 
 cookies_delete(_) ->
-    Url = <<"https://httpbin.org/cookies/delete?cname">>,
-    CookieJar = [<<"httpbin.org\tFALSE\t/\tTRUE\t0\tcname\tcvalue">>],
-    {ok, #{status := 200, cookiejar := [_], body := Body}} =
-        katipo:get(?POOL, Url, #{cookiejar => CookieJar, followlocation => true}),
+    GetUrl = <<"https://httpbin.org/cookies/set?cname=cvalue">>,
+    Opts = #{followlocation => true},
+    {ok, #{status := 200, cookiejar := CookieJar}} = katipo:get(?POOL, GetUrl, Opts),
+    DeleteUrl = <<"https://httpbin.org/cookies/delete?cname">>,
+    {ok, #{status := 200, body := Body}} =
+        katipo:get(?POOL, DeleteUrl, #{cookiejar => CookieJar, followlocation => true}),
     Json = jsx:decode(Body),
     [{}] = proplists:get_value(<<"cookies">>, Json).
 
@@ -367,20 +398,19 @@ cookies_bad_cookie_jar(_) ->
 
 %% TODO
 redirect_to(_) ->
-    {ok, #{status := 302}} = katipo:get(?POOL, <<"https://httpbin.org/redirect-to?url=https://google.com">>).
+    {ok, #{status := 302}} = katipo:get(?POOL, <<"https://nghttp2.org/httpbin/redirect-to?url=https://google.com">>).
 
 connecttimeout_ms(_) ->
     {error, #{code := operation_timedout}} =
         katipo:get(?POOL, <<"http://google.com">>, #{connecttimeout_ms => 1}).
 
 followlocation_true(_) ->
-    {ok, #{status := 200, headers := Headers}} =
-        katipo:get(?POOL, <<"https://httpbin.org/redirect/6">>, #{followlocation => true}),
-    1 = length(proplists:get_all_values(<<"Server">>, Headers)).
+    {ok, #{status := 200}} =
+        katipo:get(?POOL, <<"https://nghttp2.org/httpbin/redirect/6">>, #{followlocation => true}).
 
 followlocation_false(_) ->
     {ok, #{status := 302}} =
-        katipo:get(?POOL, <<"https://httpbin.org/redirect/6">>, #{followlocation => false}).
+        katipo:get(?POOL, <<"https://nghttp2.org/httpbin/redirect/6">>, #{followlocation => false}).
 
 tcp_fastopen_true(_) ->
     case katipo:get(?POOL, <<"https://httpbin.org/get">>, #{tcp_fastopen => true}) of
@@ -402,9 +432,12 @@ tcp_fastopen_false(_) ->
     end.
 
 interface(_) ->
+    Travis = os:getenv("TRAVIS") == "true",
     Interface = case os:type() of
                     {unix, darwin} ->
                         <<"en0">>;
+                    {unix, _} when Travis->
+                        <<"ens4">>;
                     {unix, _} ->
                         <<"eth0">>;
                     _ ->
@@ -417,10 +450,11 @@ interface_unknown(_) ->
     {error, #{code := interface_failed}} =
         katipo:get(?POOL, <<"https://httpbin.org/get">>, #{interface => <<"cannot_be_an_interface">>}).
 
-unix_socket_path(_) ->
-    case katipo:get(?POOL, <<"http://localhost/images/json">>, #{unix_socket_path => <<"/var/run/docker.sock">>}) of
+unix_socket_path(Config) ->
+    Filename = list_to_binary(?config(unix_socket_file, Config)),
+    case katipo:get(?POOL, <<"http://localhost/unix">>, #{unix_socket_path => Filename}) of
         {ok, #{status := 200, headers := Headers}} ->
-            <<"Docker/",_/binary>> = proplists:get_value(<<"Server">>, Headers);
+            <<"Cowboy">> = proplists:get_value(<<"server">>, Headers);
         {error, #{code := bad_opts}} ->
             ct:pal("unix_socket_path not supported by installed version of curl"),
             ok
@@ -438,7 +472,7 @@ unix_socket_path_cant_connect(_) ->
 maxredirs(_) ->
     Opts = #{followlocation => true, maxredirs => 2},
     {error, #{code := too_many_redirects, message := <<"Maximum (2) redirects followed">>}} =
-        katipo:get(?POOL, <<"https://httpbin.org/redirect/6">>, Opts).
+        katipo:get(?POOL, <<"https://nghttp2.org/httpbin/redirect/6">>, Opts).
 
 basic_unauthorised(_) ->
     {ok, #{status := 401}} =
@@ -481,6 +515,16 @@ lock_data_ssl_session_false(_) ->
                   #{lock_data_ssl_session => false}),
     Json = jsx:decode(Body),
     [{<<"a">>, <<"!@#$%^&*()_+">>}] = proplists:get_value(<<"args">>, Json).
+
+doh_url(_) ->
+    case katipo:doh_url_available() of
+        true ->
+            {ok, #{status := 301}} =
+                katipo:get(?POOL, <<"https://google.com">>,
+                           #{doh_url => <<"https://1.1.1.1/dns-query">>});
+        false ->
+            ok
+    end.
 
 badopts(_) ->
     {error, #{code := bad_opts, message := Message}} =
@@ -579,11 +623,11 @@ port_late_response(_) ->
 pool_opts(_) ->
     PoolName = pool_opts,
     PoolSize = 1,
-    PoolOpts = [{pipelining, true},
+    PoolOpts = [{pipelining, multiplex},
                 {max_pipeline_length, 5},
                 {max_total_connections, 10},
                 {ignore_junk_opt, hithere}],
-    {ok, _} = katipo_pool:start(PoolName, PoolSize, PoolOpts),
+    {error, _} = katipo_pool:start(PoolName, PoolSize, PoolOpts),
     ok = katipo_pool:stop(PoolName).
 
 verify_host_verify_peer_ok(_) ->
@@ -594,12 +638,21 @@ verify_host_verify_peer_ok(_) ->
     [{ok, _} = katipo:get(?POOL, <<"https://google.com">>, O) || O <- Opts].
 
 verify_host_verify_peer_error(_) ->
-    {error, #{code := ssl_cacert}} =
+    {error, #{code := Code}} =
          katipo:get(?POOL, <<"https://localhost:8443">>,
                     #{ssl_verifyhost => true, ssl_verifypeer => true}),
-    {error, #{code := ssl_cacert}} =
+    %% TODO: this could be made to reflect the ifdef from katipo.c...
+    ok = case Code of
+             ssl_cacert -> ok;
+             peer_failed_verification -> ok
+         end,
+    {error, #{code := Code}} =
          katipo:get(?POOL, <<"https://localhost:8443">>,
                     #{ssl_verifyhost => false, ssl_verifypeer => true}),
+    ok = case Code of
+             ssl_cacert -> ok;
+             peer_failed_verification -> ok
+         end,
     {ok, #{status := 200}} =
         katipo:get(?POOL, <<"https://localhost:8443">>,
                    #{ssl_verifyhost => true, ssl_verifypeer => false}),
@@ -622,6 +675,47 @@ badssl(_) ->
         katipo:get(?POOL, <<"https://self-signed.badssl.com/">>),
     {error, _} =
         katipo:get(?POOL, <<"https://untrusted-root.badssl.com/">>).
+
+badssl_client_cert(Config) ->
+    {ok, #{status := 400}} =
+        katipo:get(?POOL, <<"https://client.badssl.com">>,
+                   #{ssl_verifyhost => true,
+                     ssl_verifypeer => true}),
+    CertFile = ?config(cert_file, Config),
+    KeyFile = ?config(key_file, Config),
+    %% Certificate provided but no key
+    {error, #{code := ssl_certproblem}} =
+        katipo:get(?POOL, <<"https://client.badssl.com">>,
+                   #{ssl_verifyhost => true,
+                     ssl_verifypeer => true,
+                     sslcert => CertFile}),
+    %% This key requires a passphrase
+    {error, #{code := ssl_certproblem}} =
+        katipo:get(?POOL, <<"https://client.badssl.com">>,
+                   #{ssl_verifyhost => true,
+                     ssl_verifypeer => true,
+                     sslcert => CertFile,
+                     sslkey => KeyFile}),
+    {ok, #{status := 200}} =
+        katipo:get(?POOL, <<"https://client.badssl.com">>,
+                   #{ssl_verifyhost => true,
+                     ssl_verifypeer => true,
+                     sslcert => CertFile,
+                     sslkey => KeyFile,
+                     keypasswd => <<"badssl.com">>}),
+    case katipo:sslkey_blob_available() of
+        true ->
+            KeyDer = ?config(decrypted_key_der, Config),
+            {ok, #{status := 200}} =
+                katipo:get(?POOL, <<"https://client.badssl.com">>,
+                        #{ssl_verifyhost => true,
+                            ssl_verifypeer => true,
+                            sslcert => CertFile,
+                            sslkey_blob => KeyDer});
+        false ->
+            ok
+    end,
+    ok.
 
 proxy_get(_) ->
     Url = <<"http://httpbin.org/get?a=%21%40%23%24%25%5E%26%2A%28%29_%2B">>,
@@ -650,8 +744,7 @@ session_new(_) ->
         katipo_session:req(Req, Session),
     {state, ?POOL, #{cookiejar := CookieJar}} = Session2,
     Json = jsx:decode(Body),
-    [{<<"cname">>, <<"cvalue">>}] = proplists:get_value(<<"cookies">>, Json),
-    [<<"httpbin.org\tFALSE\t/\tTRUE\t0\tcname\tcvalue">>] = CookieJar.
+    [{<<"cname">>, <<"cvalue">>}] = proplists:get_value(<<"cookies">>, Json).
 
 session_new_bad_opts(_) ->
     {error, #{code := bad_opts}} =
@@ -711,7 +804,7 @@ session_update_bad_opts(_) ->
 
 max_total_connections(_) ->
     PoolName = max_total_connections,
-    {ok, _} = katipo_pool:start(PoolName, 1, [{max_total_connections, 1}]),
+    {ok, _} = katipo_pool:start(PoolName, 1, [{pipelining, nothing}, {max_total_connections, 1}]),
     Self = self(),
     Fun = fun() ->
                   {ok, #{status := 200}} =
@@ -755,6 +848,13 @@ metrics_false(_) ->
     {ok, #{status := 200} = Res} =
         katipo:head(?POOL, <<"https://httpbin.org/get">>, #{return_metrics => false}),
     false = maps:is_key(metrics, Res).
+
+http2_get(_) ->
+    {ok, #{status := 200, body := Body}} =
+        katipo:get(?POOL, <<"https://nghttp2.org/httpbin/get?a=%21%40%23%24%25%5E%26%2A%28%29_%2B">>,
+                   #{http_version => curl_http_version_2_prior_knowledge}),
+    Json = jsx:decode(Body),
+    [{<<"a">>, <<"!@#$%^&*()_+">>}] = proplists:get_value(<<"args">>, Json).
 
 repeat_until_true(Fun) ->
     try

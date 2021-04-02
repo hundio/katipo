@@ -1,25 +1,12 @@
-sudo: required
-dist: trusty
-group: edge
+language: nix
+nix: 2.3.10
 
-language: erlang
+env:
+  - NIX_PATH=nixpkgs=https://github.com/NixOS/nixpkgs/archive/f5e8bdd07d1afaabf6b37afc5497b1e498b8046f.tar.gz
 
-services:
-  - docker
-
-otp_release:
-  - 19.1
-  - 20.0
-  - 20.1
-  - 21.0
-
-script: rebar3 update && rebar3 ct --readable=false && rebar3 dialyzer && rebar3 coveralls send
+script:
+  - nix-shell -p rebar3 libevent curl --run 'rebar3 update && rebar3 ct && rebar3 dialyzer && rebar3 coveralls send'
 
 cache:
   directories:
-  - $HOME/.cache/rebar3/
-
-addons:
-  apt:
-    packages:
-      - libevent-dev
+    - $HOME/.cache/rebar3/

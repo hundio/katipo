@@ -38,6 +38,13 @@
 #define K_CURLOPT_INTERFACE 18
 #define K_CURLOPT_UNIX_SOCKET_PATH 19
 #define K_CURLOPT_LOCK_DATA_SSL_SESSION 20
+#define K_CURLOPT_DOH_URL 21
+#define K_CURLOPT_HTTP_VERSION 22
+#define K_CURLOPT_VERBOSE 23
+#define K_CURLOPT_SSLCERT 24
+#define K_CURLOPT_SSLKEY 25
+#define K_CURLOPT_SSLKEY_BLOB 26
+#define K_CURLOPT_KEYPASSWD 27
 
 #define K_CURLAUTH_BASIC 100
 #define K_CURLAUTH_DIGEST 101
@@ -108,6 +115,14 @@ typedef struct _EasyOpts {
   char *curlopt_interface;
   char *curlopt_unix_socket_path;
   long curlopt_lock_data_ssl_session;
+  char *curlopt_doh_url;
+  long curlopt_http_version;
+  long curlopt_verbose;
+  char *curlopt_sslcert;
+  char *curlopt_sslkey;
+  char *curlopt_sslkey_blob;
+  long curlopt_sslkey_blob_size;
+  char *curlopt_keypasswd;
 } EasyOpts;
 
 static const char *curl_error_code(CURLcode error) {
@@ -216,8 +231,6 @@ static const char *curl_error_code(CURLcode error) {
       return "telnet_option_syntax";
     case CURLE_OBSOLETE50:
       return "obsolete50";
-    case CURLE_PEER_FAILED_VERIFICATION:
-      return "peer_failed_verification";
     case CURLE_GOT_NOTHING:
       return "got_nothing";
     case CURLE_SSL_ENGINE_NOTFOUND:
@@ -237,6 +250,9 @@ static const char *curl_error_code(CURLcode error) {
     #if LIBCURL_VERSION_NUM < 0x073E00 /* Gone since 7.62.0 */
     case CURLE_SSL_CACERT:
       return "ssl_cacert";
+    #else
+    case CURLE_PEER_FAILED_VERIFICATION:
+      return "peer_failed_verification";
     #endif
     case CURLE_BAD_CONTENT_ENCODING:
       return "bad_content_encoding";
@@ -744,12 +760,14 @@ static void new_conn(long method, char *url, struct curl_slist *req_headers,
 
   curl_easy_setopt(conn->easy, CURLOPT_URL, conn->url);
   curl_easy_setopt(conn->easy, CURLOPT_HTTPHEADER, conn->req_headers);
-  // curl_easy_setopt(conn->easy, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2_0);
+  if (eopts.curlopt_http_version) {
+    curl_easy_setopt(conn->easy, CURLOPT_HTTP_VERSION, eopts.curlopt_http_version);
+  }
   curl_easy_setopt(conn->easy, CURLOPT_WRITEFUNCTION, write_cb);
   curl_easy_setopt(conn->easy, CURLOPT_WRITEDATA, conn);
   curl_easy_setopt(conn->easy, CURLOPT_HEADERFUNCTION, header_cb);
   curl_easy_setopt(conn->easy, CURLOPT_HEADERDATA, conn);
-  // curl_easy_setopt(conn->easy, CURLOPT_VERBOSE, 1L);
+  curl_easy_setopt(conn->easy, CURLOPT_VERBOSE, eopts.curlopt_verbose);
   curl_easy_setopt(conn->easy, CURLOPT_ERRORBUFFER, conn->error);
   curl_easy_setopt(conn->easy, CURLOPT_PRIVATE, conn);
   curl_easy_setopt(conn->easy, CURLOPT_ACCEPT_ENCODING, "gzip,deflate");
@@ -807,31 +825,56 @@ static void new_conn(long method, char *url, struct curl_slist *req_headers,
     curl_easy_setopt(conn->easy, CURLOPT_COOKIELIST, nc->data);
     nc = nc->next;
   }
+  #if LIBCURL_VERSION_NUM >= 0x073E00 /* Available since 7.62.0 */
+  curl_easy_setopt(conn->easy, CURLOPT_DOH_URL, eopts.curlopt_doh_url);
+  #endif
   if (eopts.curlopt_lock_data_ssl_session) {
     curl_easy_setopt(conn->easy, CURLOPT_SHARE, global->shobject);
   }
+  if (eopts.curlopt_sslcert != NULL) {
+    curl_easy_setopt(conn->easy, CURLOPT_SSLCERT,
+                     eopts.curlopt_sslcert);
+  }
+  if (eopts.curlopt_sslkey != NULL) {
+    curl_easy_setopt(conn->easy, CURLOPT_SSLKEY,
+                     eopts.curlopt_sslkey);
+  }
+  #if LIBCURL_VERSION_NUM >= 0x074700 /* Available since 7.71.0 */
+  if (eopts.curlopt_sslkey_blob != NULL) {
+    struct curl_blob blob;
+    blob.data = eopts.curlopt_sslkey_blob;
+    blob.len = eopts.curlopt_sslkey_blob_size;
+    blob.flags = CURL_BLOB_COPY;
+    curl_easy_setopt(conn->easy, CURLOPT_SSLKEY_BLOB, &blob);
+    curl_easy_setopt(conn->easy, CURLOPT_SSLKEYTYPE, "DER");
+  }
+  #endif
+  #if LIBCURL_VERSION_NUM < 0x070902 /* Renamed in 7.9.2 */
+  #define CURLOPT_KEYPASSWD CURLOPT_SSLCERTPASSWD
+  #elif LIBCURL_VERSION_NUM < 0x071004 /* and again in 7.16.4 */
+  #define CURLOPT_KEYPASSWD CURLOPT_SSLKEYPASSWD
+  #endif
+  if (eopts.curlopt_keypasswd != NULL) {
+    curl_easy_setopt(conn->easy, CURLOPT_KEYPASSWD,
+                     eopts.curlopt_keypasswd);
+  } else if (eopts.curlopt_sslkey != NULL || eopts.curlopt_sslkey_blob != NULL) {
+    /* This is to suppress an "Enter PEM pass phrase" prompt if the key requires
+       a passphrase and none was provided */
+    curl_easy_setopt(conn->easy, CURLOPT_KEYPASSWD, "");
+  }
 
-  if (eopts.curlopt_capath != NULL) {
-    free(eopts.curlopt_capath);
-  }
-  if (eopts.curlopt_cacert != NULL) {
-    free(eopts.curlopt_cacert);
-  }
-  if (eopts.curlopt_username != NULL) {
-    free(eopts.curlopt_username);
-  }
-  if (eopts.curlopt_password != NULL) {
-    free(eopts.curlopt_password);
-  }
-  if (eopts.curlopt_proxy != NULL) {
-    free(eopts.curlopt_proxy);
-  }
-  if (eopts.curlopt_interface != NULL) {
-    free(eopts.curlopt_interface);
-  }
-  if (eopts.curlopt_unix_socket_path != NULL) {
-    free(eopts.curlopt_unix_socket_path);
-  }
+  free(eopts.curlopt_capath);
+  free(eopts.curlopt_cacert);
+  free(eopts.curlopt_username);
+  free(eopts.curlopt_password);
+  free(eopts.curlopt_proxy);
+  free(eopts.curlopt_interface);
+  free(eopts.curlopt_unix_socket_path);
+  free(eopts.curlopt_doh_url);
+  free(eopts.curlopt_sslcert);
+  free(eopts.curlopt_sslkey);
+  free(eopts.curlopt_sslkey_blob);
+  free(eopts.curlopt_keypasswd);
 
   set_method(method, conn);
   rc = curl_multi_add_handle(global->multi, conn->easy);
@@ -855,8 +898,8 @@ static void erl_input(struct bufferevent *ev, void *arg) {
 
   GlobalInfo *global = (GlobalInfo *)arg;
   struct evbuffer *input = bufferevent_get_input(from_erlang);
-  struct curl_slist *req_headers;
-  struct curl_slist *req_cookies;
+  struct curl_slist *req_headers = NULL;
+  struct curl_slist *req_cookies = NULL;
   char *header;
   char *cookie;
   int num_headers;
@@ -982,6 +1025,14 @@ static void erl_input(struct bufferevent *ev, void *arg) {
     eopts.curlopt_interface = NULL;
     eopts.curlopt_unix_socket_path = NULL;
     eopts.curlopt_lock_data_ssl_session = 0;
+    eopts.curlopt_doh_url = NULL;
+    eopts.curlopt_http_version = 0;
+    eopts.curlopt_verbose = 0;
+    eopts.curlopt_sslcert = NULL;
+    eopts.curlopt_sslkey = NULL;
+    eopts.curlopt_sslkey_blob = NULL;
+    eopts.curlopt_sslkey_blob_size = 0;
+    eopts.curlopt_keypasswd = NULL;
 
     if (ei_decode_list_header(buf, &index, &num_eopts)) {
       errx(2, "Couldn't decode eopts length");
@@ -1035,6 +1086,12 @@ static void erl_input(struct bufferevent *ev, void *arg) {
         case K_CURLOPT_LOCK_DATA_SSL_SESSION:
           eopts.curlopt_lock_data_ssl_session = eopt_long;
           break;
+        case K_CURLOPT_HTTP_VERSION:
+          eopts.curlopt_http_version = eopt_long;
+          break;
+        case K_CURLOPT_VERBOSE:
+          eopts.curlopt_verbose = eopt_long;
+          break;
         default:
           errx(2, "Unknown eopt long value %ld", eopt);
         }
@@ -1067,6 +1124,22 @@ static void erl_input(struct bufferevent *ev, void *arg) {
         case K_CURLOPT_UNIX_SOCKET_PATH:
           eopts.curlopt_unix_socket_path = eopt_binary;
           break;
+        case K_CURLOPT_DOH_URL:
+          eopts.curlopt_doh_url = eopt_binary;
+          break;
+        case K_CURLOPT_SSLCERT:
+          eopts.curlopt_sslcert = eopt_binary;
+          break;
+        case K_CURLOPT_SSLKEY:
+          eopts.curlopt_sslkey = eopt_binary;
+          break;
+        case K_CURLOPT_SSLKEY_BLOB:
+          eopts.curlopt_sslkey_blob = eopt_binary;
+          eopts.curlopt_sslkey_blob_size = size;
+          break;
+        case K_CURLOPT_KEYPASSWD:
+          eopts.curlopt_keypasswd = eopt_binary;
+          break;
         default:
           errx(2, "Unknown eopt binary value %ld", eopt);
         }
@@ -1087,8 +1160,8 @@ static void erl_input(struct bufferevent *ev, void *arg) {
       errx(2, "Couldn't skip empty eopt list");
     }
 
-    new_conn(method, url, req_headers, req_cookies, post_data, post_data_size,
-             eopts, pid, ref, arg);
+    new_conn(method, url, req_headers, req_cookies, post_data,
+             post_data_size, eopts, pid, ref, arg);
 
     free(buf);
   }
@@ -1118,10 +1191,11 @@ static void erlang_init(GlobalInfo *global) {
 int main(int argc, char **argv) {
   GlobalInfo global;
   int option_index = 0;
-  int pipelining_flag = 0;
   int c;
+  long pipelining = 0;
+
   struct option long_options[] = {
-    { "pipelining", no_argument, &pipelining_flag, 1 },
+    { "pipelining", required_argument, 0, 'p' },
     { "max-pipeline-length", required_argument, 0, 'a' },
     { "max-total-connections", required_argument, 0, 'c' },
     { 0, 0, 0, 0 }
@@ -1153,11 +1227,17 @@ int main(int argc, char **argv) {
   curl_multi_setopt(global.multi, CURLMOPT_TIMERDATA, &global);
 
   while (1) {
-    c = getopt_long(argc, argv, "ac:", long_options, &option_index);
+    c = getopt_long(argc, argv, "pac:", long_options, &option_index);
     if (c == -1)
       break;
     switch (c) {
-      case 0:
+      case 'p':
+        pipelining = atoi(optarg);
+        if (pipelining < 0 || pipelining > 2) {
+          errx(2, "Bad pipelining arg '%ld'\n", pipelining);
+        }
+        curl_multi_setopt(global.multi, CURLMOPT_PIPELINING,
+                          atoi(optarg));
         break;
       case 'a':
         curl_multi_setopt(global.multi, CURLMOPT_MAX_PIPELINE_LENGTH,
@@ -1171,8 +1251,6 @@ int main(int argc, char **argv) {
         errx(2, "Unknown option '%c'\n", c);
     }
   }
-
-  curl_multi_setopt(global.multi, CURLMOPT_PIPELINING, pipelining_flag);
 
   erlang_init(&global);
 
